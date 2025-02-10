@@ -8,7 +8,7 @@ import random
 import json
 import os
 import requests
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 import logging
 from PIL import Image
 from io import BytesIO
@@ -143,6 +143,18 @@ class InstagramDownloader:
             raise
 
 
+def calculate_delay(batch_type: str) -> Tuple[int, int]:
+    """Returns (min_delay, max_delay) in seconds based on batch type"""
+    delays = {
+        'SEED': (45, 60),      # Faster for initial dataset
+        'INITIAL': (60, 90),   # Standard delay
+        'WEEKLY': (60, 90),    # Standard delay
+        'MONTHLY': (45, 75),   # Slightly faster for regular updates
+        'CUSTOM': (60, 90),    # Standard delay
+    }
+    return delays.get(batch_type, (60, 90))  # Default to standard delay
+
+
 downloader = InstagramDownloader()
 
 
@@ -171,16 +183,25 @@ async def download_posts(username: str, request: DownloadRequest, background_tas
 
 
 async def process_downloads(username: str, batchId: str, maxPosts: int):
-    """Process downloads with rate limiting and webhooks"""
+    """Process downloads with optimized rate limiting and webhooks"""
     try:
         profile = instaloader.Profile.from_username(downloader.loader.context, username)
+        
+        # Get batch type from batchId (assumes format like "SEED_20250210")
+        batch_type = batchId.split('_')[0].upper()
+        min_delay, max_delay = calculate_delay(batch_type)
+        
+        logger.info(f"Starting downloads for {username} with batch type {batch_type}")
+        logger.info(f"Using delay range: {min_delay}-{max_delay} seconds")
 
         for idx, post in enumerate(profile.get_posts()):
             if idx >= maxPosts:
                 break
 
-            # Rate limiting delay
-            time.sleep(random.uniform(60, 90))
+            # Rate limiting delay with batch-specific timing
+            delay = random.uniform(min_delay, max_delay)
+            logger.info(f"Waiting {delay:.2f} seconds before next download")
+            time.sleep(delay)
 
             try:
                 # Download image
@@ -211,8 +232,8 @@ async def process_downloads(username: str, batchId: str, maxPosts: int):
                 downloader.send_webhook(post_data)
 
                 # Cleanup local file
-                os.remove(local_path)
-                logger.info(f"Local file removed: {local_path}")
+                os.remove(local_path + ".jpg")
+                logger.info(f"Local file removed: {local_path}.jpg")
 
             except Exception as e:
                 logger.error(f"Error processing post {post.mediaid}: {str(e)}")
