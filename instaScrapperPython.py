@@ -13,6 +13,7 @@ import logging
 from PIL import Image
 from io import BytesIO
 import traceback
+from threading import Lock
 
 app = FastAPI()
 
@@ -46,6 +47,33 @@ class InstagramDownloader:
         )
         self.bucket_name = os.getenv('R2_BUCKET')
         self.java_webhook_url = os.getenv('JAVA_WEBHOOK_URL')
+        
+        # Rate limiter initialization
+        self.last_request_time = time.time()
+        self.lock = Lock()
+
+    def rate_limited_sleep(self, min_delay: int, max_delay: int):
+        """
+        Thread-safe rate limiting method
+        
+        Args:
+            min_delay: Minimum delay in seconds
+            max_delay: Maximum delay in seconds
+        """
+        with self.lock:
+            current_time = time.time()
+            elapsed_time = current_time - self.last_request_time
+            
+            if elapsed_time < min_delay:
+                sleep_time = min_delay - elapsed_time
+                logger.info(f"Rate limit: Sleeping for {sleep_time:.2f} seconds")
+                time.sleep(sleep_time)
+            else:
+                delay = random.uniform(min_delay, max_delay)
+                logger.info(f"Rate limit: Sleeping for {delay:.2f} seconds")
+                time.sleep(delay)
+                
+            self.last_request_time = time.time()
 
     def login(self):
         try:
@@ -198,12 +226,11 @@ async def process_downloads(username: str, batchId: str, maxPosts: int):
             if idx >= maxPosts:
                 break
 
-            # Rate limiting delay with batch-specific timing
-            delay = random.uniform(min_delay, max_delay)
-            logger.info(f"Waiting {delay:.2f} seconds before next download")
-            time.sleep(delay)
-
             try:
+                # Apply rate limiting before each download
+                downloader.rate_limited_sleep(min_delay, max_delay)
+                logger.info(f"Downloading post {post.mediaid} for {username}")
+
                 # Download image
                 local_path = f"temp_{post.mediaid}"
                 downloader.loader.download_pic(
@@ -249,8 +276,3 @@ async def process_downloads(username: str, batchId: str, maxPosts: int):
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
