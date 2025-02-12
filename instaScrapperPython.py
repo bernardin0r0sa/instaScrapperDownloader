@@ -1,5 +1,10 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, Boolean
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 import instaloader
 import boto3
 from botocore.client import Config
@@ -8,19 +13,67 @@ import random
 import json
 import os
 import requests
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 import logging
 from PIL import Image
 from io import BytesIO
 import traceback
 from threading import Lock
-
-app = FastAPI()
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Database configuration
+DB_URL = os.getenv('DATABASE_URL', 'jwskcccssg8ooko4s8wggso8:3306/instaScrapper')
+DATABASE_URL = f"mysql+mysqlconnector://{DB_URL}"
+
+# Create engine with MySQL specific settings
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=5,
+    max_overflow=10,
+    pool_timeout=30,
+    pool_recycle=1800,
+    connect_args={
+        'connect_timeout': 60
+    }
+)
+
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+
+# Database Models
+class Influencer(Base):
+    __tablename__ = "influencers"
+    id = Column(Integer, primary_key=True)
+    username = Column(String(255))
+    category = Column(String(255))
+    gender = Column(String(50))
+    is_plus_size = Column(Boolean)
+
+class ProcessedPost(Base):
+    __tablename__ = "processed_posts"
+    id = Column(String(255), primary_key=True)
+    image_url = Column(String(1024))
+    vector_id = Column(String(255))
+    influencer_id = Column(Integer)
+    batch_id = Column(String(255))
+    processed_at = Column(DateTime)
+    analysis_json = Column(Text)
+    status = Column(String(20), default='PENDING_ANALYSIS')
+    error_message = Column(Text)
+
+class DownloadHistory(Base):
+    __tablename__ = "download_history"
+    id = Column(Integer, primary_key=True)
+    influencer_id = Column(Integer)
+    batch_id = Column(String(255))
+    started_at = Column(DateTime)
+    completed_at = Column(DateTime)
+    status = Column(String(50))
+    error_message = Column(Text)
 
 class InstagramDownloader:
     def __init__(self):
@@ -46,20 +99,12 @@ class InstagramDownloader:
             )
         )
         self.bucket_name = os.getenv('R2_BUCKET')
-        self.java_webhook_url = os.getenv('JAVA_WEBHOOK_URL')
         
         # Rate limiter initialization
         self.last_request_time = time.time()
         self.lock = Lock()
 
     def rate_limited_sleep(self, min_delay: int, max_delay: int):
-        """
-        Thread-safe rate limiting method
-        
-        Args:
-            min_delay: Minimum delay in seconds
-            max_delay: Maximum delay in seconds
-        """
         with self.lock:
             current_time = time.time()
             elapsed_time = current_time - self.last_request_time
@@ -81,7 +126,6 @@ class InstagramDownloader:
             password = os.getenv('INSTAGRAM_PASSWORD')
             session_file = os.getenv('INSTAGRAM_SESSION_FILE')
 
-            # Session data (if you have it in memory)
             session_data = {
                 "csrftoken": os.getenv('CSRF_TOKEN'),
                 "sessionid": os.getenv('SESSION_ID'),
@@ -90,7 +134,6 @@ class InstagramDownloader:
                 "ig_did": os.getenv('IG_DID')
             }
 
-            # Check if session_data is complete
             if all(session_data.values()):
                 self.loader.context.load_session(username, session_data)
                 logger.info("Session loaded from environment variables.")
@@ -98,9 +141,7 @@ class InstagramDownloader:
                 self.loader.load_session_from_file(username, session_file)
                 logger.info("Session loaded from file.")
             else:
-                # If no session file or data, perform login with username and password
                 self.loader.login(username, password)
-                # Save session to file for future use
                 self.loader.save_session_to_file(session_file)
                 logger.info("Logged in and session saved to file.")
 
@@ -111,7 +152,6 @@ class InstagramDownloader:
             return False
 
     def compress_image(self, file_path: str) -> bytes:
-        """Compress the image to ensure it is under 5MB"""
         max_size = 5 * 1024 * 1024  # 5MB
         quality = 0.9  # Initial quality
 
@@ -120,7 +160,6 @@ class InstagramDownloader:
             img.save(output, format='JPEG', quality=int(quality * 100))
             image_size = output.tell()
 
-            # Reduce quality until the image size is below the max size
             while image_size > max_size and quality > 0.1:
                 quality -= 0.1
                 output = BytesIO()
@@ -133,15 +172,10 @@ class InstagramDownloader:
             return output.getvalue()
 
     def upload_to_r2(self, file_path: str, key: str) -> str:
-        """Upload file to R2 and return a presigned URL"""
         try:
-            # Compress the image if necessary
             image_data = self.compress_image(file_path)
-
-            # Upload the compressed image to R2
             self.s3_client.put_object(Bucket=self.bucket_name, Key=key, Body=image_data)
 
-            # Generate a presigned URL with a 24-hour expiration
             r2_url = self.s3_client.generate_presigned_url(
                 'get_object',
                 Params={'Bucket': self.bucket_name, 'Key': key},
@@ -155,79 +189,51 @@ class InstagramDownloader:
             logger.error(traceback.format_exc())
             raise
 
-    def send_webhook(self, post_data: Dict):
-        """Send webhook to Java service"""
-        try:
-            response = requests.post(
-                self.java_webhook_url,
-                json=post_data,
-                headers={'Content-Type': 'application/json'}
-            )
-            response.raise_for_status()
-            logger.info(f"Webhook sent for post ID: {post_data['id']}")
-        except Exception as e:
-            logger.error(f"Webhook error: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise
-
-
-def calculate_delay(batch_type: str) -> Tuple[int, int]:
-    """Returns (min_delay, max_delay) in seconds based on batch type"""
-    delays = {
-        'SEED': (45, 60),      # Faster for initial dataset
-        'INITIAL': (60, 90),   # Standard delay
-        'WEEKLY': (60, 90),    # Standard delay
-        'MONTHLY': (45, 75),   # Slightly faster for regular updates
-        'CUSTOM': (60, 90),    # Standard delay
-    }
-    return delays.get(batch_type, (60, 90))  # Default to standard delay
-
-
+# Initialize FastAPI and components
+app = FastAPI()
 downloader = InstagramDownloader()
-
+scheduler = AsyncIOScheduler()
 
 class DownloadRequest(BaseModel):
     username: str
     batchId: str
     maxPosts: Optional[int] = 50
 
+class CustomBatchRequest(BaseModel):
+    usernames: Optional[List[str]] = None
+    maxPosts: Optional[int] = 25
 
-@app.on_event("startup")
-async def startup_event():
-    if not downloader.login():
-        raise Exception("Failed to login to Instagram")
+def get_max_posts(batch_type: str) -> int:
+    defaults = {
+        'SEED': 25,
+        'INITIAL': 35,
+        'WEEKLY': 25,
+        'MONTHLY': 20,
+        'CUSTOM': 25
+    }
+    return defaults.get(batch_type, 25)
 
-
-@app.post("/api/download/{username}")
-async def download_posts(username: str, request: DownloadRequest, background_tasks: BackgroundTasks):
-    """Endpoint to initiate post download for an influencer"""
+async def process_downloads(username: str, batch_id: str, max_posts: int):
+    """Process downloads and store in database"""
     try:
-        background_tasks.add_task(process_downloads, username, request.batchId, request.maxPosts)
-        return {"status": "success", "message": f"Download initiated for {username}"}
-    except Exception as e:
-        logger.error(f"Error in download_posts: {str(e)}")
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-async def process_downloads(username: str, batchId: str, maxPosts: int):
-    """Process downloads with optimized rate limiting and webhooks"""
-    try:
+        db = SessionLocal()
         profile = instaloader.Profile.from_username(downloader.loader.context, username)
         
-        # Get batch type from batchId (assumes format like "SEED_20250210")
-        batch_type = batchId.split('_')[0].upper()
+        # Get batch type from batch_id
+        batch_type = batch_id.split('_')[0].upper()
         min_delay, max_delay = calculate_delay(batch_type)
         
         logger.info(f"Starting downloads for {username} with batch type {batch_type}")
-        logger.info(f"Using delay range: {min_delay}-{max_delay} seconds")
+        
+        influencer = db.query(Influencer).filter(Influencer.username == username).first()
+        if not influencer:
+            raise ValueError(f"Influencer {username} not found in database")
 
         for idx, post in enumerate(profile.get_posts()):
-            if idx >= maxPosts:
+            if idx >= max_posts:
                 break
 
             try:
-                # Apply rate limiting before each download
                 downloader.rate_limited_sleep(min_delay, max_delay)
                 logger.info(f"Downloading post {post.mediaid} for {username}")
 
@@ -238,25 +244,23 @@ async def process_downloads(username: str, batchId: str, maxPosts: int):
                     url=post.url,
                     mtime=post.date_local
                 )
-                logger.info(f"Image downloaded: {local_path}.jpg")
 
                 # Upload to R2
                 r2_key = f"fashion/{username}/{post.mediaid}.jpg"
                 r2_url = downloader.upload_to_r2(local_path + ".jpg", r2_key)
 
-                # Prepare webhook data
-                post_data = {
-                    'id': str(post.mediaid),
-                    'username': username,
-                    'batchId': batchId,
-                    'imageUrl': r2_url,
-                    'timestamp': post.date_utc.isoformat(),
-                    'caption': post.caption,
-                    'likes': post.likes
-                }
-
-                # Send webhook to Java service
-                downloader.send_webhook(post_data)
+                # Create processed post entry
+                processed_post = ProcessedPost(
+                    id=str(post.mediaid),
+                    image_url=r2_url,
+                    influencer_id=influencer.id,
+                    batch_id=batch_id,
+                    processed_at=datetime.now(),
+                    status='PENDING_ANALYSIS'
+                )
+                
+                db.add(processed_post)
+                db.commit()
 
                 # Cleanup local file
                 os.remove(local_path + ".jpg")
@@ -271,8 +275,125 @@ async def process_downloads(username: str, batchId: str, maxPosts: int):
         logger.error(f"Error processing user {username}: {str(e)}")
         logger.error(traceback.format_exc())
         raise
+    finally:
+        db.close()
 
+async def process_batch(batch_type: str, batch_size: int = 5):
+    try:
+        db = SessionLocal()
+        batch_id = f"{batch_type}_{datetime.now().strftime('%Y%m%d')}"
+        
+        influencers = db.query(Influencer)\
+            .join(InfluencerBatches)\
+            .filter(BatchTypes.name == batch_type)\
+            .limit(batch_size)\
+            .all()
+
+        for influencer in influencers:
+            history = DownloadHistory(
+                influencer_id=influencer.id,
+                batch_id=batch_id,
+                started_at=datetime.now(),
+                status='STARTED'
+            )
+            db.add(history)
+            db.commit()
+
+            try:
+                await process_downloads(
+                    username=influencer.username,
+                    batch_id=batch_id,
+                    max_posts=get_max_posts(batch_type)
+                )
+                
+                history.status = 'COMPLETED'
+                history.completed_at = datetime.now()
+            except Exception as e:
+                history.status = 'FAILED'
+                history.error_message = str(e)
+                logger.error(f"Error processing {influencer.username}: {str(e)}")
+            
+            db.commit()
+            
+    except Exception as e:
+        logger.error(f"Batch processing error: {str(e)}")
+    finally:
+        db.close()
+
+@app.on_event("startup")
+async def start_scheduler():
+    if not downloader.login():
+        raise Exception("Failed to login to Instagram")
+
+    # Initial batch check
+    if os.getenv('ENABLE_INITIAL_BATCH', 'false').lower() == 'true':
+        scheduler.add_job(
+            process_batch,
+            'date',
+            args=['INITIAL']
+        )
+
+    # Seed batch check
+    if os.getenv('ENABLE_SEED_BATCH', 'false').lower() == 'true':
+        scheduler.add_job(
+            process_batch,
+            'date',
+            args=['SEED']
+        )
+
+    # Weekly batch - Every Monday at 1 AM
+    scheduler.add_job(
+        process_batch,
+        CronTrigger(day_of_week='mon', hour=1),
+        args=['WEEKLY']
+    )
+    
+    # Monthly batch - 1st of every month at 2 AM
+    scheduler.add_job(
+        process_batch,
+        CronTrigger(day=1, hour=2),
+        args=['MONTHLY']
+    )
+    
+    scheduler.start()
+
+@app.post("/api/batch/custom")
+async def start_custom_batch(request: CustomBatchRequest, background_tasks: BackgroundTasks):
+    try:
+        db = SessionLocal()
+        batch_id = f"CUSTOM_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        if request.usernames:
+            influencers = db.query(Influencer)\
+                .filter(Influencer.username.in_(request.usernames))\
+                .all()
+        else:
+            influencers = db.query(Influencer)\
+                .join(InfluencerBatches)\
+                .filter(BatchTypes.name == 'CUSTOM')\
+                .all()
+        
+        if not influencers:
+            raise HTTPException(status_code=404, detail="No influencers found")
+            
+        background_tasks.add_task(
+            process_batch,
+            'CUSTOM',
+            len(influencers)
+        )
+        
+        return {"status": "success", "batch_id": batch_id}
+        
+    except Exception as e:
+        logger.error(f"Custom batch error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
 
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
