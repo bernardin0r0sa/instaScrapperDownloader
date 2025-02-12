@@ -1,8 +1,8 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, Boolean
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, Boolean, Table, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, relationship
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import instaloader
@@ -26,8 +26,15 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Database configuration
-DB_URL = os.getenv('DATABASE_URL', 'jwskcccssg8ooko4s8wggso8:3306/instaScrapper')
-DATABASE_URL = f"mysql+mysqlconnector://{DB_URL}"
+username = os.getenv('DATABASE_USERNAME')
+password = os.getenv('DATABASE_PASSWORD')
+db_url = os.getenv('DATABASE_URL')
+
+if not all([username, password, db_url]):
+    raise ValueError("Database environment variables not properly configured")
+
+# Create the full MySQL connection URL
+DATABASE_URL = f"mysql+mysqlconnector://{username}:{password}@{db_url}"
 
 # Create engine with MySQL specific settings
 engine = create_engine(
@@ -45,14 +52,6 @@ SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
 # Database Models
-class Influencer(Base):
-    __tablename__ = "influencers"
-    id = Column(Integer, primary_key=True)
-    username = Column(String(255))
-    category = Column(String(255))
-    gender = Column(String(50))
-    is_plus_size = Column(Boolean)
-
 class ProcessedPost(Base):
     __tablename__ = "processed_posts"
     id = Column(String(255), primary_key=True)
@@ -74,6 +73,43 @@ class DownloadHistory(Base):
     completed_at = Column(DateTime)
     status = Column(String(50))
     error_message = Column(Text)
+
+class Influencer(Base):
+    __tablename__ = "influencers"
+    
+    id = Column(Integer, primary_key=True)  # SQLAlchemy auto-handles the BIGINT/auto-increment
+    username = Column(String(255))
+    category = Column(String(255))
+    gender = Column(String(50))
+    is_plus_size = Column(Boolean)
+    
+    # The @ManyToMany relationship is handled through relationship() and secondary table
+    batch_types = relationship(
+        "BatchType",
+        secondary="influencer_batches",
+        back_populates="influencers"
+    )
+
+class BatchType(Base):
+    __tablename__ = "batch_types"
+    
+    id = Column(Integer, primary_key=True)
+    name = Column(String(50))
+    frequency = Column(String(50))
+    
+    # The mapped relationship
+    influencers = relationship(
+        "Influencer",
+        secondary="influencer_batches",
+        back_populates="batch_types"
+    )
+
+InfluencerBatches = Table(
+    'influencer_batches',
+    Base.metadata,
+    Column('influencer_id', Integer, ForeignKey('influencers.id'), primary_key=True),
+    Column('batch_type_id', Integer, ForeignKey('batch_types.id'), primary_key=True)
+)
 
 class InstagramDownloader:
     def __init__(self):
@@ -191,6 +227,18 @@ class InstagramDownloader:
 
 # Initialize FastAPI and components
 app = FastAPI()
+
+def calculate_delay(batch_type: str) -> Tuple[int, int]:
+    """Returns (min_delay, max_delay) in seconds based on batch type"""
+    delays = {
+        'SEED': (45, 60),      # Faster for initial dataset
+        'INITIAL': (60, 90),   # Standard delay
+        'WEEKLY': (60, 90),    # Standard delay
+        'MONTHLY': (45, 75),   # Slightly faster for regular updates
+        'CUSTOM': (60, 90),    # Standard delay
+    }
+    return delays.get(batch_type, (60, 90))  # Default to standard delay
+
 downloader = InstagramDownloader()
 scheduler = AsyncIOScheduler()
 
@@ -285,7 +333,7 @@ async def process_batch(batch_type: str, batch_size: int = 5):
         
         influencers = db.query(Influencer)\
             .join(InfluencerBatches)\
-            .filter(BatchTypes.name == batch_type)\
+            .filter(BatchType.name == batch_type)\
             .limit(batch_size)\
             .all()
 
@@ -370,7 +418,7 @@ async def start_custom_batch(request: CustomBatchRequest, background_tasks: Back
         else:
             influencers = db.query(Influencer)\
                 .join(InfluencerBatches)\
-                .filter(BatchTypes.name == 'CUSTOM')\
+                .filter(BatchType.name == 'CUSTOM')\
                 .all()
         
         if not influencers:
