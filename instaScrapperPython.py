@@ -239,7 +239,7 @@ class CustomBatchRequest(BaseModel):
 
 def calculate_delay(batch_type: str) -> Tuple[int, int]:
     delays = {
-        'SEED': (45, 60),
+        'SEED': (75, 90),
         'INITIAL': (60, 90),
         'WEEKLY': (60, 90),
         'MONTHLY': (45, 75),
