@@ -1,10 +1,11 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, Boolean, Table, ForeignKey
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, Boolean, Table, ForeignKey, func, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from sqlalchemy.orm import Session
 import instaloader
 import boto3
 from botocore.client import Config
@@ -20,6 +21,7 @@ from io import BytesIO
 import traceback
 from threading import Lock
 from datetime import datetime
+from contextlib import contextmanager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -33,10 +35,8 @@ db_url = os.getenv('DATABASE_URL')
 if not all([username, password, db_url]):
     raise ValueError("Database environment variables not properly configured")
 
-# Create the full MySQL connection URL
 DATABASE_URL = f"mysql+mysqlconnector://{username}:{password}@{db_url}"
 
-# Create engine with MySQL specific settings
 engine = create_engine(
     DATABASE_URL,
     pool_size=5,
@@ -51,7 +51,6 @@ engine = create_engine(
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
-# Database Models
 class ProcessedPost(Base):
     __tablename__ = "processed_posts"
     id = Column(String(255), primary_key=True)
@@ -77,13 +76,12 @@ class DownloadHistory(Base):
 class Influencer(Base):
     __tablename__ = "influencers"
     
-    id = Column(Integer, primary_key=True)  # SQLAlchemy auto-handles the BIGINT/auto-increment
+    id = Column(Integer, primary_key=True)
     username = Column(String(255))
     category = Column(String(255))
     gender = Column(String(50))
     is_plus_size = Column(Boolean)
     
-    # The @ManyToMany relationship is handled through relationship() and secondary table
     batch_types = relationship(
         "BatchType",
         secondary="influencer_batches",
@@ -97,7 +95,6 @@ class BatchType(Base):
     name = Column(String(50))
     frequency = Column(String(50))
     
-    # The mapped relationship
     influencers = relationship(
         "Influencer",
         secondary="influencer_batches",
@@ -111,6 +108,10 @@ InfluencerBatches = Table(
     Column('batch_type_id', Integer, ForeignKey('batch_types.id'), primary_key=True)
 )
 
+class BatchProcessingError(Exception):
+    """Custom exception for batch processing errors"""
+    pass
+
 class InstagramDownloader:
     def __init__(self):
         self.loader = instaloader.Instaloader(
@@ -123,7 +124,6 @@ class InstagramDownloader:
             quiet=True
         )
 
-        # Initialize S3 client for R2
         self.s3_client = boto3.client(
             's3',
             endpoint_url=os.getenv('R2_ENDPOINT'),
@@ -136,7 +136,6 @@ class InstagramDownloader:
         )
         self.bucket_name = os.getenv('R2_BUCKET')
         
-        # Rate limiter initialization
         self.last_request_time = time.time()
         self.lock = Lock()
 
@@ -225,20 +224,7 @@ class InstagramDownloader:
             logger.error(traceback.format_exc())
             raise
 
-# Initialize FastAPI and components
 app = FastAPI()
-
-def calculate_delay(batch_type: str) -> Tuple[int, int]:
-    """Returns (min_delay, max_delay) in seconds based on batch type"""
-    delays = {
-        'SEED': (45, 60),      # Faster for initial dataset
-        'INITIAL': (60, 90),   # Standard delay
-        'WEEKLY': (60, 90),    # Standard delay
-        'MONTHLY': (45, 75),   # Slightly faster for regular updates
-        'CUSTOM': (60, 90),    # Standard delay
-    }
-    return delays.get(batch_type, (60, 90))  # Default to standard delay
-
 downloader = InstagramDownloader()
 scheduler = AsyncIOScheduler()
 
@@ -251,6 +237,16 @@ class CustomBatchRequest(BaseModel):
     usernames: Optional[List[str]] = None
     maxPosts: Optional[int] = 25
 
+def calculate_delay(batch_type: str) -> Tuple[int, int]:
+    delays = {
+        'SEED': (45, 60),
+        'INITIAL': (60, 90),
+        'WEEKLY': (60, 90),
+        'MONTHLY': (45, 75),
+        'CUSTOM': (60, 90),
+    }
+    return delays.get(batch_type, (60, 90))
+
 def get_max_posts(batch_type: str) -> int:
     defaults = {
         'SEED': 25,
@@ -261,13 +257,12 @@ def get_max_posts(batch_type: str) -> int:
     }
     return defaults.get(batch_type, 25)
 
-async def process_downloads(username: str, batch_id: str, max_posts: int):
-    """Process downloads and store in database"""
+async def process_downloads(username: str, batch_id: str, max_posts: int, db: Session) -> dict:
+
+    stats = {'processed': 0, 'failed': 0, 'errors': []}
+    
     try:
-        db = SessionLocal()
         profile = instaloader.Profile.from_username(downloader.loader.context, username)
-        
-        # Get batch type from batch_id
         batch_type = batch_id.split('_')[0].upper()
         min_delay, max_delay = calculate_delay(batch_type)
         
@@ -285,7 +280,6 @@ async def process_downloads(username: str, batch_id: str, max_posts: int):
                 downloader.rate_limited_sleep(min_delay, max_delay)
                 logger.info(f"Downloading post {post.mediaid} for {username}")
 
-                # Download image
                 local_path = f"temp_{post.mediaid}"
                 downloader.loader.download_pic(
                     filename=local_path,
@@ -293,11 +287,9 @@ async def process_downloads(username: str, batch_id: str, max_posts: int):
                     mtime=post.date_local
                 )
 
-                # Upload to R2
                 r2_key = f"fashion/{username}/{post.mediaid}.jpg"
                 r2_url = downloader.upload_to_r2(local_path + ".jpg", r2_key)
 
-                # Create processed post entry
                 processed_post = ProcessedPost(
                     id=str(post.mediaid),
                     image_url=r2_url,
@@ -309,33 +301,79 @@ async def process_downloads(username: str, batch_id: str, max_posts: int):
                 
                 db.add(processed_post)
                 db.commit()
+                stats['processed'] += 1
 
-                # Cleanup local file
                 os.remove(local_path + ".jpg")
                 logger.info(f"Local file removed: {local_path}.jpg")
 
             except Exception as e:
-                logger.error(f"Error processing post {post.mediaid}: {str(e)}")
-                logger.error(traceback.format_exc())
+                error_msg = f"Error processing post {post.mediaid}: {str(e)}"
+                logger.error(error_msg)
+                stats['failed'] += 1
+                stats['errors'].append(error_msg)
                 continue
 
+        return stats
+
     except Exception as e:
-        logger.error(f"Error processing user {username}: {str(e)}")
-        logger.error(traceback.format_exc())
-        raise
-    finally:
-        db.close()
+        error_msg = f"Error processing user {username}: {str(e)}"
+        logger.error(error_msg)
+        stats['errors'].append(error_msg)
+        raise BatchProcessingError(error_msg)
 
 async def process_batch(batch_type: str, batch_size: int = 5):
+    batch_id = f"{batch_type}_{datetime.now().strftime('%Y%m%d')}"
+    total_stats = {
+        'started': datetime.now(),
+        'completed': None,
+        'batch_type': batch_type,
+        'total_influencers': 0,
+        'successful_influencers': 0,
+        'failed_influencers': 0,
+        'total_posts_processed': 0,
+        'total_posts_failed': 0,
+        'skipped_influencers': 0,
+        'errors': []
+    }
+
     try:
         db = SessionLocal()
-        batch_id = f"{batch_type}_{datetime.now().strftime('%Y%m%d')}"
-        
-        influencers = db.query(Influencer)\
-            .join(InfluencerBatches)\
-            .filter(BatchType.name == batch_type)\
-            .limit(batch_size)\
-            .all()
+
+        if batch_type in ['SEED', 'INITIAL']:
+            base_query = (
+                db.query(Influencer)
+                .join(InfluencerBatches, InfluencerBatches.c.influencer_id == Influencer.id)
+                .join(BatchType, BatchType.id == InfluencerBatches.c.batch_type_id)
+                .filter(BatchType.name == batch_type)
+                .filter(
+                    ~Influencer.id.in_(
+                        db.query(DownloadHistory.influencer_id)
+                        .filter(
+                            DownloadHistory.batch_id.like('SEED_%') |
+                            DownloadHistory.batch_id.like('INITIAL_%')
+                        )
+                        .filter(DownloadHistory.status.in_(['COMPLETED', 'COMPLETED_WITH_ERRORS']))
+                        .distinct()
+                        .subquery()
+                    )
+                )
+            )
+        else:
+            base_query = (
+                db.query(Influencer)
+                .join(InfluencerBatches, InfluencerBatches.c.influencer_id == Influencer.id)
+                .join(BatchType, BatchType.id == InfluencerBatches.c.batch_type_id)
+                .filter(BatchType.name == batch_type)
+            )
+
+        influencers = base_query.limit(batch_size).all()
+        total_stats['total_influencers'] = len(influencers)
+
+        if not influencers:
+            logger.info(f"No influencers to process for {batch_type} batch")
+            return
+
+        logger.info(f"Processing {len(influencers)} influencers for {batch_type} batch")
 
         for influencer in influencers:
             history = DownloadHistory(
@@ -348,24 +386,54 @@ async def process_batch(batch_type: str, batch_size: int = 5):
             db.commit()
 
             try:
-                await process_downloads(
+                stats = await process_downloads(
                     username=influencer.username,
                     batch_id=batch_id,
-                    max_posts=get_max_posts(batch_type)
+                    max_posts=get_max_posts(batch_type),
+                    db=db
                 )
                 
-                history.status = 'COMPLETED'
+                total_stats['total_posts_processed'] += stats['processed']
+                total_stats['total_posts_failed'] += stats['failed']
+                
+                if stats['failed'] == 0:
+                    total_stats['successful_influencers'] += 1
+                    history.status = 'COMPLETED'
+                else:
+                    total_stats['failed_influencers'] += 1
+                    history.status = 'COMPLETED_WITH_ERRORS'
+                    history.error_message = '\n'.join(stats['errors'])
+                
                 history.completed_at = datetime.now()
+                db.commit()
+
             except Exception as e:
+                total_stats['failed_influencers'] += 1
                 history.status = 'FAILED'
                 history.error_message = str(e)
+                history.completed_at = datetime.now()
+                db.commit()
                 logger.error(f"Error processing {influencer.username}: {str(e)}")
-            
-            db.commit()
-            
+                continue
+
     except Exception as e:
         logger.error(f"Batch processing error: {str(e)}")
+        raise BatchProcessingError(f"Batch processing failed: {str(e)}")
     finally:
+        total_stats['completed'] = datetime.now()
+        duration = total_stats['completed'] - total_stats['started']
+        
+        logger.info(f"""
+            Batch {batch_id} completed:
+            Type: {batch_type}
+            Duration: {duration}
+            Total Influencers: {total_stats['total_influencers']}
+            Successful: {total_stats['successful_influencers']}
+            Failed: {total_stats['failed_influencers']}
+            Posts Processed: {total_stats['total_posts_processed']}
+            Posts Failed: {total_stats['total_posts_failed']}
+            Total Errors: {len(total_stats['errors'])}
+        """)
         db.close()
 
 @app.on_event("startup")
@@ -412,14 +480,19 @@ async def start_custom_batch(request: CustomBatchRequest, background_tasks: Back
         batch_id = f"CUSTOM_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
         if request.usernames:
-            influencers = db.query(Influencer)\
-                .filter(Influencer.username.in_(request.usernames))\
-                .all()
+            query = (
+                db.query(Influencer)
+                .filter(Influencer.username.in_(request.usernames))
+            )
         else:
-            influencers = db.query(Influencer)\
-                .join(InfluencerBatches)\
-                .filter(BatchType.name == 'CUSTOM')\
-                .all()
+            query = (
+                db.query(Influencer)
+                .join(InfluencerBatches, InfluencerBatches.c.influencer_id == Influencer.id)
+                .join(BatchType, BatchType.id == InfluencerBatches.c.batch_type_id)
+                .filter(BatchType.name == 'CUSTOM')
+            )
+        
+        influencers = query.all()
         
         if not influencers:
             raise HTTPException(status_code=404, detail="No influencers found")
@@ -438,9 +511,47 @@ async def start_custom_batch(request: CustomBatchRequest, background_tasks: Back
     finally:
         db.close()
 
+@app.get("/api/batch/status/{batch_id}")
+async def get_batch_status(batch_id: str):
+    try:
+        db = SessionLocal()
+        
+        history_records = db.query(DownloadHistory).filter(
+            DownloadHistory.batch_id == batch_id
+        ).all()
+        
+        if not history_records:
+            raise HTTPException(status_code=404, detail="Batch not found")
+            
+        stats = {
+            'total_influencers': len(history_records),
+            'completed': len([r for r in history_records if r.status == 'COMPLETED']),
+            'failed': len([r for r in history_records if r.status == 'FAILED']),
+            'in_progress': len([r for r in history_records if r.status == 'STARTED']),
+            'started_at': min(r.started_at for r in history_records if r.started_at),
+            'latest_update': max((r.completed_at for r in history_records if r.completed_at), default=None)
+        }
+        
+        return stats
+        
+    except Exception as e:
+        logger.error(f"Error getting batch status: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    try:
+        db = SessionLocal()
+        # Test database connection
+        db.execute(text("SELECT 1"))
+        return {"status": "healthy", "details": {"database": "connected"}}
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
+        return {"status": "unhealthy", "details": {"error": str(e)}}
+    finally:
+        db.close()
 
 if __name__ == "__main__":
     import uvicorn
