@@ -321,7 +321,10 @@ async def process_downloads(username: str, batch_id: str, max_posts: int, db: Se
         stats['errors'].append(error_msg)
         raise BatchProcessingError(error_msg)
 
-async def process_batch(batch_type: str, batch_size: int = 5):
+async def process_batch(batch_type: str, batch_size: int = None):
+    if batch_size is None:
+        batch_size = int(os.getenv('APP_DOWNLOAD_BATCH_SIZE', 5))
+            
     batch_id = f"{batch_type}_{datetime.now().strftime('%Y%m%d')}"
     total_stats = {
         'started': datetime.now(),
